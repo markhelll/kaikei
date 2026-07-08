@@ -1,0 +1,1366 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#F2ECDF" />
+<title>お小遣い帳</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #F2ECDF; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  window.addEventListener("error", function (e) {
+    var root = document.getElementById("root");
+    if (root && !root.hasChildNodes()) {
+      root.innerHTML = '<div style="padding:24px;font-family:sans-serif;color:#B23A2E;font-size:12px;white-space:pre-wrap;line-height:1.6">起動エラー:\n' +
+        String((e && e.message) || e) + '\n(' + ((e && e.filename) || '') + ':' + ((e && e.lineno) || '') + ')</div>';
+    }
+  });
+</script>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── 軽量アイコン(lucide互換の最小SVG実装) ──
+function icon(paths) {
+  return function Icon({ size = 24, color = "currentColor", className = "", strokeWidth = 2 }) {
+    return (
+      <svg
+        className={className}
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke={color}
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        dangerouslySetInnerHTML={{ __html: paths }}
+      />
+    );
+  };
+}
+const ImageIcon = icon('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>');
+const PenLine = icon('<path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/>');
+const X = icon('<path d="M18 6 6 18"/><path d="m6 6 12 12"/>');
+const Trash2 = icon('<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>');
+const ChevronLeft = icon('<path d="m15 18-6-6 6-6"/>');
+const ChevronRight = icon('<path d="m9 18 6-6-6-6"/>');
+const Loader2 = icon('<path d="M21 12a9 9 0 1 1-6.219-8.56"/>');
+const Check = icon('<path d="M20 6 9 17l-5-5"/>');
+
+// ── localStorageアダプタ: 既存コードのwindow.storage呼び出しをそのまま活かす ──
+window.storage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error("key not found");
+    return { key, value: v };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+};
+
+const PALETTE = {
+  paper: "#F2ECDF",
+  paperDark: "#E8DFC8",
+  ink: "#26344A",
+  stamp: "#B23A2E",
+  income: "#3D6B4F",
+  rule: "#C9BFA8",
+  text: "#33302A",
+  textFaint: "#8A8270",
+};
+
+const EXPENSE_CATS = ["食費", "交通", "日用品", "趣味・DTM", "交際費", "固定費", "その他"];
+const INCOME_CATS = ["お小遣い", "副収入", "その他"];
+const STORAGE_KEY = "kozukaicho-data";
+
+function todayStr() {
+  const d = new Date();
+  const tz = d.getTimezoneOffset() * 60000;
+  return new Date(d - tz).toISOString().slice(0, 10);
+}
+
+function fmtN(n) {
+  return Math.abs(n).toLocaleString("ja-JP");
+}
+
+function fmtYen(n) {
+  return "¥" + fmtN(n);
+}
+
+function fmtMonthLabel(offset) {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offset);
+  return `${d.getFullYear()}年${d.getMonth() + 1}月`;
+}
+
+function monthKeyOf(offset) {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offset);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+const WEEKDAY_JP = ["日", "月", "火", "水", "木", "金", "土"];
+
+function calendarWeeksFor(offset) {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() + offset);
+  const year = d.getFullYear();
+  const month = d.getMonth();
+  const firstWeekday = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  const cells = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(null);
+  for (let day = 1; day <= daysInMonth; day++) {
+    cells.push({ day, dateStr: `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}` });
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  return weeks;
+}
+
+function fmtDateHeader(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const wd = WEEKDAY_JP[new Date(y, m - 1, d).getDay()];
+  return `${m}月${d}日(${wd})`;
+}
+
+function useGoogleFonts() {
+  useEffect(() => {
+    if (document.getElementById("kzk-fonts")) return;
+    const link = document.createElement("link");
+    link.id = "kzk-fonts";
+    link.rel = "stylesheet";
+    link.href =
+      "https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap";
+    document.head.appendChild(link);
+  }, []);
+}
+
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("読み込み失敗"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("画像デコード失敗"));
+      img.onload = () => {
+        const maxW = 800;
+        const scale = Math.min(1, maxW / img.width);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", 0.75));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// ── 端末内OCR(Tesseract.js) ──
+let tesseractLoadPromise = null;
+function loadTesseract() {
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    script.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("no Tesseract")));
+    script.onerror = () => reject(new Error("script load failed"));
+    document.head.appendChild(script);
+  });
+  return tesseractLoadPromise;
+}
+
+async function runOcr(dataUrl, onStage) {
+  if (onStage) onStage("OCRエンジン読み込み中…");
+  const Tesseract = await loadTesseract();
+  let worker;
+  try {
+    if (onStage) onStage("文字認識の準備中…");
+    worker = await Tesseract.createWorker("jpn+eng");
+
+    if (onStage) onStage("画像を解析中(日本語)…");
+    const jpResult = await worker.recognize(dataUrl);
+    const jpText = (jpResult && jpResult.data && jpResult.data.text) || "";
+
+    // 英字ブランド名の誤読を減らすため、英語のみでもう一度読む
+    if (onStage) onStage("画像を解析中(英語)…");
+    let enText = "";
+    try {
+      await worker.reinitialize("eng");
+      const enResult = await worker.recognize(dataUrl);
+      enText = (enResult && enResult.data && enResult.data.text) || "";
+    } catch (e) {
+      // 英語エンジン失敗時は日本語結果だけで続行
+    }
+
+    const amount = extractAmountFromText(jpText);
+    const amountCandidates = collectAmountCandidates(jpText);
+    const date = extractDateFromText(jpText);
+    // 店名は英語結果を優先しつつ、良い候補が無ければ日本語結果で補完
+    const storeEn = extractStoreFromText(enText, true);
+    const storeJp = extractStoreFromText(jpText, false);
+    const store = storeEn || storeJp;
+
+    const storeCandidates = collectStoreCandidates(jpText, enText);
+    const store = (storeCandidates && storeCandidates.length) ? storeCandidates[0] : null;
+    return { amount, amountCandidates, date, store, storeCandidates, rawText: jpText };
+  } finally {
+    if (worker) {
+      try { await worker.terminate(); } catch (e) {}
+    }
+  }
+}
+
+function extractDateFromText(text) {
+  const norm = normalizeDigits(text);
+  // 「2026年7月2日」「2026/07/02」「2026-7-2」などに対応
+  const m = norm.match(/(20[0-9][0-9])[^0-9]{1,3}([0-9]{1,2})[^0-9]{1,3}([0-9]{1,2})/);
+  if (m) {
+    const y = parseInt(m[1], 10), mo = parseInt(m[2], 10), d = parseInt(m[3], 10);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    }
+  }
+  return null;
+}
+
+function normalizeDigits(s) {
+  // OCRがよく間違える文字を数字に補正
+  return s
+    .replace(/[Oo〇]/g, "0")
+    .replace(/[lI|]/g, "1")
+    .replace(/[SｓＳ]/g, "5")
+    .replace(/[，、]/g, ",")
+    .replace(/．/g, ".")
+    .replace(/[０-９]/g, (d) => String("０１２３４５６７８９".indexOf(d)));
+}
+
+function extractAmountFromText(text) {
+  const norm = normalizeDigits(text);
+  const lines = norm.split("\n");
+  const priorityWords = ["合計", "ご注文金額", "お支払", "支払金額", "総額", "利用金額", "ご利用金額", "金額"];
+  const numRe = /([0-9][0-9,]{2,})\s*円/g;
+
+  for (const line of lines) {
+    if (priorityWords.some((w) => line.includes(w))) {
+      const m = [...line.matchAll(numRe)];
+      if (m.length) return parseInt(m[m.length - 1][1].replace(/,/g, ""), 10);
+    }
+  }
+  const all = [...norm.matchAll(numRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  const allF = all.filter((n) => n >= 10 && n <= 10000000);
+  if (allF.length) return Math.max(...allF);
+
+  const yenRe = /[¥￥]\s*([0-9][0-9,]{2,})/g;
+  const allYen = [...norm.matchAll(yenRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  if (allYen.length) return Math.max(...allYen);
+
+  // カンマ区切りの大きな数字(10,000 のような決済画面の金額)。時刻/日付を避けるため3桁区切り必須
+  const commaNumRe = /([1-9][0-9]{0,2}(?:,[0-9]{3})+)/g;
+  const commaNums = [...norm.matchAll(commaNumRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  const commaF = commaNums.filter((n) => n <= 10000000);
+  if (commaF.length) return Math.max(...commaF);
+
+  return null;
+}
+
+// 金額候補を複数集める(自動で拾えなかった時にタップ選択できるように)
+function collectAmountCandidates(text) {
+  const norm = normalizeDigits(text);
+  const found = new Set();
+  const push = (n) => { if (n >= 10 && n <= 10000000) found.add(n); };
+  for (const m of norm.matchAll(/([0-9][0-9,]{2,})\s*円/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  for (const m of norm.matchAll(/[¥￥]\s*([0-9][0-9,]{2,})/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  for (const m of norm.matchAll(/([1-9][0-9]{0,2}(?:,[0-9]{3})+)/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  // 単独の3桁以上の数字も候補に(時刻の可能性がある4桁未満は控えめに)
+  for (const m of norm.matchAll(/\b([0-9]{3,7})\b/g)) {
+    const n = parseInt(m[1], 10);
+    if (n >= 100) push(n);
+  }
+  return [...found].sort((a, b) => b - a).slice(0, 6);
+}
+
+function normalizeDigitsMarker() {}
+
+
+function extractStoreFromText(text, englishMode) {
+  if (!text) return null;
+  const rawLines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+
+  // 明らかにノイズな行を除外
+  const skipRe = /(合計|小計|税込|税抜|消費税|お預|釣|電話|TEL|FAX|〒|住所|様|ご注文|お届け|明細|領収|レシート|注文番号|伝票|支払|クレジット|ご利用|利用速報|カード|VISA|Master|AMEX|ポイント|残高|金額|数量|単価|店舗|レジ|営業|時間|定休)/;
+  const timeRe = /^\d{1,2}[:：]\d{2}/;                 // 先頭が時刻
+  const dateRe = /\d{4}[-\/年]|\d{1,2}[\/月]\d{1,2}/;   // 日付
+  const onlySymbol = /^[\d\W_]+$/;                       // 数字記号のみ
+
+  const candidates = [];
+  for (const line of rawLines) {
+    let clean = line.replace(/\s+/g, " ").trim();
+    clean = clean.replace(/^\d{1,2}[:：]\d{2}\s*/, "").replace(/^[『「【\[\(]\s*/, "").trim();
+    if (clean.length < 2 || clean.length > 30) continue;
+    if (skipRe.test(clean)) continue;
+    if (timeRe.test(clean)) continue;
+    if (dateRe.test(clean)) continue;
+    if (onlySymbol.test(clean)) continue;
+
+    let score = 0;
+    if (englishMode) {
+      // 英語モード: 連続した大文字英字ブランド名(XSOLLA, ASOBI STORE等)を強く優先
+      const upperMatch = clean.match(/\b[A-Z][A-Z]{2,}\b/);
+      if (upperMatch) {
+        score += 10;
+        // ブランド名だけを抜き出す(周囲のノイズ除去)
+        const brandOnly = clean.match(/\b[A-Z][A-Za-z]{2,}(?:\s+[A-Z][A-Za-z]+)?\b/);
+        if (brandOnly) clean = brandOnly[0];
+      } else if (/[A-Za-z]{4,}/.test(clean)) {
+        score += 3;
+      } else {
+        continue; // 英語モードでは英字が無い行はスキップ
+      }
+    } else {
+      // 日本語モード
+      if (/[A-Z]{3,}/.test(clean)) score += 5;
+      if (/[ァ-ヴー]{3,}/.test(clean)) score += 3;
+      if (/[一-龠]{2,}/.test(clean)) score += 2;
+      if (/[A-Za-z]{4,}/.test(clean)) score += 2;
+    }
+
+    const symbolRatio = (clean.replace(/[^\d\W_]/g, "").length) / clean.length;
+    if (symbolRatio > 0.4) score -= 3;
+    if (clean.length >= 4 && clean.length <= 20) score += 1;
+
+    candidates.push({ text: clean, score });
+  }
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  if (candidates[0].score <= 0) return null;
+  return candidates[0].text;
+}
+
+const DEFAULT_MEMO_PRESETS = ["ゲーマーズ", "ASOBI STORE", "メルカリ", "XSOLLA", "paidy", "アニメイト", "とらのあな", "駿河屋", "ライブ物販", "コンビニ"];
+const MEMO_PRESETS_KEY = "kozukaicho-memo-presets";
+
+function collectStoreCandidates(jpText, enText) {
+  const skipRe = /(合計|小計|税込|税抜|消費税|お預|釣|電話|TEL|FAX|〒|住所|様|ご注文|お届け|明細|領収|レシート|注文番号|伝票|支払|クレジット|ご利用|利用速報|カード|VISA|Master|AMEX|ポイント|残高|金額|数量|単価|店舗|レジ|営業|時間|定休)/;
+  const timeRe = /^\d{1,2}[:：]\d{2}/;
+  const dateRe = /\d{4}[-\/年]|\d{1,2}[\/月]\d{1,2}/;
+  const onlySymbol = /^[\d\W_]+$/;
+  const seen = new Set();
+  const out = [];
+  for (const text of [enText, jpText]) {
+    if (!text) continue;
+    for (const line of text.split("\n")) {
+      let clean = line.replace(/\s+/g, " ").trim();
+      clean = clean.replace(/^\d{1,2}[:：]\d{2}\s*/, "").replace(/^[『「【\[\(]\s*/, "").trim();
+      if (clean.length < 2 || clean.length > 24) continue;
+      if (skipRe.test(clean) || timeRe.test(clean) || dateRe.test(clean) || onlySymbol.test(clean)) continue;
+      if (seen.has(clean)) continue;
+      seen.add(clean);
+      out.push(clean);
+      if (out.length >= 6) return out;
+    }
+  }
+  return out;
+}
+
+function blankForm() {
+  return { date: todayStr(), type: "expense", amount: "", category: EXPENSE_CATS[0], memo: "", photo: null };
+}
+
+// チャットでClaudeが伝えた内容(コピーしたテキスト)を解析する
+// 1件のフォーマット: 1行目「支出」or「収入」、2行目 金額、3行目 日付、4行目 こうもく、5行目以降 メモ
+// 複数件は「---」または空行で区切る
+function parseSingleEntry(lines) {
+  if (lines.length === 0) return null;
+  const result = {};
+  let idx = 0;
+
+  if (/^支出$/.test(lines[idx])) { result.type = "expense"; idx++; }
+  else if (/^収入$/.test(lines[idx])) { result.type = "income"; idx++; }
+
+  if (idx < lines.length) {
+    const numMatch = lines[idx].replace(/[,¥円]/g, "").match(/[0-9]+/);
+    if (numMatch) { result.amount = numMatch[0]; idx++; }
+  }
+
+  if (idx < lines.length) {
+    const dateMatch = lines[idx].match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+    if (dateMatch) {
+      result.date = `${dateMatch[1]}-${String(dateMatch[2]).padStart(2, "0")}-${String(dateMatch[3]).padStart(2, "0")}`;
+      idx++;
+    }
+  }
+
+  const allCats = [...EXPENSE_CATS, ...INCOME_CATS];
+  if (idx < lines.length && allCats.includes(lines[idx])) {
+    result.category = lines[idx];
+    idx++;
+  }
+
+  if (idx < lines.length) {
+    result.memo = lines.slice(idx).join(" ");
+  }
+
+  if (!result.amount) return null;
+  return result;
+}
+
+function parsePastedEntries(raw) {
+  // 「---」か空行でブロックに分割
+  const blocks = raw
+    .split(/\n\s*(?:---+\s*\n|\n)/)
+    .map((b) => b.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !/^---+$/.test(l)))
+    .filter((b) => b.length > 0);
+
+  const parsed = blocks.map(parseSingleEntry).filter(Boolean);
+  return parsed;
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ minHeight: "100vh", background: "#F2ECDF", padding: 24, fontFamily: "sans-serif", color: "#B23A2E" }}>
+          <h3 style={{ margin: "0 0 8px" }}>アプリでエラーが発生しました</h3>
+          <pre style={{ fontSize: 11, whiteSpace: "pre-wrap", color: "#33302A" }}>
+            {String(this.state.error && (this.state.error.message || this.state.error))}
+            {"\n\n"}
+            {String((this.state.error && this.state.error.stack) || "").slice(0, 500)}
+          </pre>
+          <p style={{ fontSize: 12, color: "#8A8270" }}>この画面をスクショしてClaudeに送ってください。</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function KozukaichoInner() {
+  useGoogleFonts();
+
+  const [entries, setEntries] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [monthOffset, setMonthOffset] = useState(0);
+  const [viewMode, setViewMode] = useState("ledger"); // 'ledger' | 'calendar'
+  const [selectedDay, setSelectedDay] = useState(null); // 'YYYY-MM-DD' | null
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [form, setForm] = useState(blankForm());
+  const [stamping, setStamping] = useState(false);
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteNote, setPasteNote] = useState(null);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrNote, setOcrNote] = useState(null);
+  const [ocrCandidates, setOcrCandidates] = useState([]);
+  const [amountCandidates, setAmountCandidates] = useState([]);
+  const [memoPresets, setMemoPresets] = useState(DEFAULT_MEMO_PRESETS);
+  const [showPresetEdit, setShowPresetEdit] = useState(false);
+  const [newPreset, setNewPreset] = useState("");
+  const [storageStatus, setStorageStatus] = useState(null); // null | 'ok' | 'load_error' | 'save_error' | 'no_storage'
+  const [storageDetail, setStorageDetail] = useState("");
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      if (!window.storage || typeof window.storage.get !== "function") {
+        setStorageStatus("no_storage");
+        setStorageDetail("window.storageが存在しません");
+        setLoaded(true);
+        return;
+      }
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          setEntries(Array.isArray(parsed.entries) ? parsed.entries : []);
+        }
+        setStorageStatus("ok");
+      } catch (e) {
+        // キーが無い(初回)のか保存機能自体の故障なのかを、書き込みセルフテストで判定する
+        try {
+          const testKey = "kozukaicho-selftest";
+          const testVal = String(Date.now());
+          await window.storage.set(testKey, testVal, false);
+          const back = await window.storage.get(testKey, false);
+          if (back && back.value === testVal) {
+            // 保存機能は正常。さっきのget失敗は初回(キー未作成)だっただけ
+            setStorageStatus("ok");
+          } else {
+            setStorageStatus("load_error");
+            setStorageDetail("セルフテストの読み戻しが一致しません");
+          }
+        } catch (e2) {
+          setStorageStatus("load_error");
+          setStorageDetail(`セルフテストも失敗: ${String(e2 && e2.message)}`);
+        }
+      } finally {
+        setLoaded(true);
+      }
+      // メモ候補プリセットの読み込み
+      try {
+        const pres = await window.storage.get(MEMO_PRESETS_KEY, false);
+        if (pres && pres.value) {
+          const arr = JSON.parse(pres.value);
+          if (Array.isArray(arr) && arr.length) setMemoPresets(arr);
+        }
+      } catch (e) {
+        // 未設定ならデフォルトのまま
+      }
+    })();
+  }, []);
+
+  const persist = useCallback(async (next) => {
+    setEntries(next);
+    try {
+      const res = await window.storage.set(STORAGE_KEY, JSON.stringify({ entries: next }), false);
+      if (!res) {
+        setStorageStatus("save_error");
+        setStorageDetail("set()がnullを返しました");
+      } else {
+        setStorageStatus("ok");
+      }
+    } catch (e) {
+      console.error("kzk: 保存失敗", e);
+      setStorageStatus("save_error");
+      setStorageDetail(String(e && e.message));
+    }
+  }, []);
+
+  function openNewForm() {
+    setEditingId(null);
+    setForm(blankForm());
+    setShowPaste(false);
+    setPasteText("");
+    setPasteNote(null);
+    setShowForm(true);
+  }
+
+  function openEditForm(entry) {
+    setEditingId(entry.id);
+    setForm({
+      date: entry.date,
+      type: entry.type,
+      amount: String(entry.amount),
+      category: entry.category,
+      memo: entry.memo || "",
+      photo: entry.photo || null,
+    });
+    setShowPaste(false);
+    setPasteText("");
+    setPasteNote(null);
+    setShowForm(true);
+  }
+
+  function closeForm() {
+    setShowForm(false);
+    setShowPaste(false);
+    setPasteText("");
+    setPasteNote(null);
+  }
+
+  function fillFromParsed(parsed) {
+    if (!parsed) {
+      setPasteNote("内容を読み取れませんでした。形式を確認してください。");
+      return;
+    }
+    setForm((f) => ({
+      ...f,
+      type: parsed.type || f.type,
+      amount: parsed.amount || f.amount,
+      date: parsed.date || f.date,
+      category: parsed.category || f.category,
+      memo: parsed.memo != null ? parsed.memo : f.memo,
+    }));
+    setPasteNote("反映しました。内容を確認して記帳してください。");
+  }
+
+  function bulkRegister(parsedList) {
+    const now = Date.now();
+    const newEntries = parsedList.map((p, i) => ({
+      id: `${now}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+      date: p.date || todayStr(),
+      type: p.type || "expense",
+      amount: parseInt(p.amount, 10),
+      category: p.category || ((p.type || "expense") === "expense" ? EXPENSE_CATS[EXPENSE_CATS.length - 1] : INCOME_CATS[INCOME_CATS.length - 1]),
+      memo: p.memo || "",
+      photo: null,
+      createdAt: now + i,
+    }));
+    persist([...entries, ...newEntries]);
+    setStamping(true);
+    setTimeout(() => setStamping(false), 650);
+    setTimeout(() => closeForm(), 400);
+  }
+
+  function processText(text) {
+    const all = parsePastedEntries(text);
+    if (all.length === 0) {
+      setPasteNote("内容を読み取れませんでした。形式を確認してください。");
+      return;
+    }
+    if (all.length === 1) {
+      fillFromParsed(all[0]);
+      return;
+    }
+    bulkRegister(all);
+    setPasteNote(`${all.length}件をまとめて記帳しました。`);
+  }
+
+  async function handleClipboardFill() {
+    setPasteNote(null);
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text && text.trim()) {
+          processText(text);
+          return;
+        }
+      } catch (e) {
+        // 権限が無い等。手動貼り付け欄にフォールバック
+      }
+    }
+    setShowPaste(true);
+    setPasteNote("自動読み取りできませんでした。下の欄に長押しで貼り付けてください。");
+  }
+
+  async function persistPresets(next) {
+    setMemoPresets(next);
+    try {
+      await window.storage.set(MEMO_PRESETS_KEY, JSON.stringify(next), false);
+    } catch (e) {
+      console.error("kzk: プリセット保存失敗", e);
+    }
+  }
+
+  function addPreset() {
+    const v = newPreset.trim();
+    if (!v || memoPresets.includes(v)) {
+      setNewPreset("");
+      return;
+    }
+    persistPresets([...memoPresets, v]);
+    setNewPreset("");
+  }
+
+  function removePreset(name) {
+    persistPresets(memoPresets.filter((p) => p !== name));
+  }
+
+  async function tryOcr(dataUrl) {
+    setOcrNote("読み取り準備中(ライブラリ読み込み)…");
+    setOcrCandidates([]);
+    setAmountCandidates([]);
+    setOcrLoading(true);
+    try {
+      const { amount, amountCandidates: amtCands, date, store, storeCandidates } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
+      setOcrCandidates(storeCandidates || []);
+      setAmountCandidates(amtCands || []);
+      setForm((f) => ({
+        ...f,
+        amount: amount != null ? String(amount) : f.amount,
+        date: date || f.date,
+        memo: store || f.memo,
+      }));
+      const parts = [];
+      if (amount != null) parts.push(`金額¥${amount.toLocaleString("ja-JP")}`);
+      if (date) parts.push(`日付${date.slice(5).replace("-", "/")}`);
+      if (store) parts.push(`メモ「${store}」`);
+      if (parts.length > 0) {
+        setOcrNote(`${parts.join(" / ")} を読み取りました。違う場合は下の候補や定番から選び直せます。`);
+      } else if ((amtCands || []).length > 0) {
+        setOcrNote("金額を自動確定できませんでした。下の「金額候補」からタップで選んでください。");
+      } else {
+        setOcrNote("読み取れませんでした。手入力してください。");
+      }
+    } catch (err) {
+      setOcrNote(`OCR失敗: ${String(err && (err.message || err))}`);
+    } finally {
+      setOcrLoading(false);
+    }
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setEditingId(null);
+    setOcrNote(null);
+    let dataUrl;
+    try {
+      dataUrl = await compressImage(file);
+    } catch (err) {
+      setForm(blankForm());
+      setShowForm(true);
+      return;
+    }
+    setForm({ ...blankForm(), photo: dataUrl });
+    setShowForm(true);
+    tryOcr(dataUrl);
+  }
+
+  function handleSubmit() {
+    const amountNum = parseInt(String(form.amount).replace(/[^0-9]/g, ""), 10);
+    if (!amountNum || amountNum <= 0) return;
+    const entry = {
+      id: editingId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      date: form.date,
+      type: form.type,
+      amount: amountNum,
+      category: form.category,
+      memo: form.memo.trim(),
+      photo: form.photo,
+      createdAt: editingId ? (entries.find((e) => e.id === editingId) || {}).createdAt || Date.now() : Date.now(),
+    };
+    const next = editingId ? entries.map((e) => (e.id === editingId ? entry : e)) : [...entries, entry];
+    persist(next);
+    setStamping(true);
+    setTimeout(() => setStamping(false), 650);
+    setTimeout(() => closeForm(), 400);
+  }
+
+  function handleDelete() {
+    if (!editingId) return;
+    persist(entries.filter((e) => e.id !== editingId));
+    closeForm();
+  }
+
+  const sortedAll = [...entries].sort((a, b) => (a.date !== b.date ? (a.date < b.date ? -1 : 1) : (a.createdAt || 0) - (b.createdAt || 0)));
+  let running = 0;
+  const withBalance = sortedAll.map((e) => {
+    running += e.type === "income" ? e.amount : -e.amount;
+    return { ...e, balance: running };
+  });
+  const overallBalance = running;
+
+  const mKey = monthKeyOf(monthOffset);
+  const monthEntries = withBalance.filter((e) => e.date.slice(0, 7) === mKey);
+  const monthIncome = monthEntries.filter((e) => e.type === "income").reduce((s, e) => s + e.amount, 0);
+  const monthExpense = monthEntries.filter((e) => e.type === "expense").reduce((s, e) => s + e.amount, 0);
+  const displayList = [...monthEntries].reverse();
+  const cats = form.type === "expense" ? EXPENSE_CATS : INCOME_CATS;
+
+  // カレンダー用: 日ごとの支出/収入合計
+  const dayTotals = {};
+  monthEntries.forEach((e) => {
+    if (!dayTotals[e.date]) dayTotals[e.date] = { expense: 0, income: 0 };
+    dayTotals[e.date][e.type] += e.amount;
+  });
+  const calWeeks = calendarWeeksFor(monthOffset);
+
+  // カレンダー下のリスト: 日付ごとにグルーピング(新しい日付が上)
+  const calFiltered = selectedDay ? monthEntries.filter((e) => e.date === selectedDay) : monthEntries;
+  const groupedByDate = {};
+  calFiltered.forEach((e) => {
+    if (!groupedByDate[e.date]) groupedByDate[e.date] = [];
+    groupedByDate[e.date].push(e);
+  });
+  const groupedDatesDesc = Object.keys(groupedByDate).sort((a, b) => (a < b ? 1 : -1));
+
+  if (!loaded) {
+    return (
+      <div style={{ minHeight: "100vh", background: PALETTE.paper, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <Loader2 className="animate-spin" color={PALETTE.ink} size={28} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: PALETTE.paper, fontFamily: "'Noto Sans JP', sans-serif", color: PALETTE.text, paddingBottom: 100 }}>
+      <style>{`
+        @keyframes stampIn { 0%{transform:scale(2.4) rotate(-14deg);opacity:0;} 55%{transform:scale(0.92) rotate(-14deg);opacity:1;} 75%{transform:scale(1.08) rotate(-14deg);} 100%{transform:scale(1) rotate(-14deg);opacity:1;} }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .kzk-spin { animation: spin 0.8s linear infinite; }
+        .kzk-row { border-bottom: 1px dashed ${PALETTE.rule}; }
+        .kzk-row:active { background: ${PALETTE.paperDark}; }
+        .kzk-btn:active { transform: scale(0.96); }
+      `}</style>
+
+      {(storageStatus === "no_storage" || storageStatus === "load_error" || storageStatus === "save_error") && (
+        <div style={{ padding: "8px 20px", background: "#B23A2E22", borderBottom: `1px solid ${PALETTE.stamp}`, fontSize: 11, color: PALETTE.stamp }}>
+          ⚠ 保存に問題があります({storageStatus === "no_storage" ? "保存機能が使えません" : storageStatus === "load_error" ? "読み込み失敗" : "保存失敗"}: {storageDetail})
+          <br />
+          このままだとアプリを閉じると記録が消えます。
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ padding: "28px 20px 18px", borderBottom: `2px solid ${PALETTE.ink}` }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+          <span style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 700, fontSize: 26, color: PALETTE.ink, letterSpacing: "0.08em" }}>
+            お小遣い帳
+          </span>
+          <span style={{ fontSize: 11, color: PALETTE.textFaint, letterSpacing: "0.1em" }}>KOZUKAI-CHO</span>
+          <span style={{ fontSize: 10, color: PALETTE.stamp, fontWeight: 700, marginLeft: 4 }}>v11</span>
+        </div>
+
+        <div style={{ marginTop: 18, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 11, color: PALETTE.textFaint, marginBottom: 4 }}>通算残高</div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 30, color: PALETTE.ink }}>
+              {fmtYen(overallBalance)}
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 11, color: PALETTE.textFaint }}>
+              入金 <span style={{ fontFamily: "'JetBrains Mono', monospace", color: PALETTE.income }}>{fmtYen(monthIncome)}</span>
+            </div>
+            <div style={{ fontSize: 11, color: PALETTE.textFaint, marginTop: 2 }}>
+              出金 <span style={{ fontFamily: "'JetBrains Mono', monospace", color: PALETTE.stamp }}>{fmtYen(monthExpense)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Month nav */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 20px", background: PALETTE.paperDark }}>
+        <button className="kzk-btn" onClick={() => setMonthOffset((m) => m - 1)} style={navBtnStyle}>
+          <ChevronLeft size={18} color={PALETTE.ink} />
+        </button>
+        <span style={{ fontFamily: "'Shippori Mincho', serif", fontWeight: 500, fontSize: 15, color: PALETTE.ink }}>{fmtMonthLabel(monthOffset)}</span>
+        <button
+          className="kzk-btn"
+          onClick={() => setMonthOffset((m) => Math.min(0, m + 1))}
+          style={{ ...navBtnStyle, opacity: monthOffset >= 0 ? 0.3 : 1 }}
+          disabled={monthOffset >= 0}
+        >
+          <ChevronRight size={18} color={PALETTE.ink} />
+        </button>
+      </div>
+
+      {/* View toggle */}
+      <div style={{ display: "flex", gap: 8, padding: "8px 20px", background: PALETTE.paperDark, borderBottom: `1px solid ${PALETTE.rule}` }}>
+        {[["ledger", "帳簿"], ["calendar", "カレンダー"]].map(([v, label]) => (
+          <button
+            key={v}
+            className="kzk-btn"
+            onClick={() => {
+              setViewMode(v);
+              setSelectedDay(null);
+            }}
+            style={{
+              flex: 1,
+              padding: "7px 0",
+              borderRadius: 999,
+              border: `1px solid ${viewMode === v ? PALETTE.ink : PALETTE.rule}`,
+              background: viewMode === v ? PALETTE.ink : "transparent",
+              color: viewMode === v ? PALETTE.paper : PALETTE.textFaint,
+              fontSize: 12,
+              fontWeight: 600,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {viewMode === "calendar" && (
+        <div style={{ padding: "10px 14px 4px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, marginBottom: 4 }}>
+            {WEEKDAY_JP.map((w, i) => (
+              <div key={w} style={{ textAlign: "center", fontSize: 10, color: i === 0 ? PALETTE.stamp : i === 6 ? PALETTE.ink : PALETTE.textFaint, padding: "2px 0" }}>
+                {w}
+              </div>
+            ))}
+          </div>
+          {calWeeks.map((week, wi) => (
+            <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2, marginBottom: 2 }}>
+              {week.map((cell, ci) => {
+                if (!cell) return <div key={ci} />;
+                const totals = dayTotals[cell.dateStr];
+                const isSelected = selectedDay === cell.dateStr;
+                return (
+                  <button
+                    key={ci}
+                    className="kzk-btn"
+                    onClick={() => setSelectedDay(isSelected ? null : cell.dateStr)}
+                    style={{
+                      aspectRatio: "1",
+                      border: `1px solid ${isSelected ? PALETTE.ink : "transparent"}`,
+                      background: isSelected ? PALETTE.paperDark : "transparent",
+                      borderRadius: 6,
+                      padding: "3px 2px",
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      justifyContent: "flex-start",
+                    }}
+                  >
+                    <span style={{ fontSize: 11, color: ci === 0 ? PALETTE.stamp : ci === 6 ? PALETTE.ink : PALETTE.text }}>{cell.day}</span>
+                    {totals && totals.expense > 0 && (
+                      <span style={{ fontSize: 8.5, fontFamily: "'JetBrains Mono', monospace", color: PALETTE.stamp, marginTop: 1 }}>
+                        {fmtN(totals.expense)}
+                      </span>
+                    )}
+                    {totals && totals.income > 0 && (
+                      <span style={{ fontSize: 8.5, fontFamily: "'JetBrains Mono', monospace", color: PALETTE.income, marginTop: 1 }}>
+                        +{fmtN(totals.income)}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {viewMode === "ledger" && (
+        <>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "52px 1fr 68px 68px 78px",
+              gap: 6,
+              padding: "8px 20px",
+              fontSize: 10,
+              color: PALETTE.textFaint,
+              letterSpacing: "0.05em",
+              borderBottom: `1px solid ${PALETTE.rule}`,
+            }}
+          >
+            <span>日付</span>
+            <span>こうもく</span>
+            <span style={{ textAlign: "right" }}>出金</span>
+            <span style={{ textAlign: "right" }}>入金</span>
+            <span style={{ textAlign: "right" }}>残高</span>
+          </div>
+
+          {displayList.length === 0 && (
+            <div style={{ padding: "48px 20px", textAlign: "center", color: PALETTE.textFaint, fontSize: 13 }}>
+              この月の記録はまだありません。
+              <br />
+              スクショを読み込むか、手で記帳してみましょう。
+            </div>
+          )}
+          {displayList.map((e) => (
+            <div
+              key={e.id}
+              className="kzk-row"
+              onClick={() => openEditForm(e)}
+              style={{ display: "grid", gridTemplateColumns: "52px 1fr 68px 68px 78px", gap: 6, padding: "12px 20px", alignItems: "center", cursor: "pointer" }}
+            >
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: PALETTE.textFaint }}>{e.date.slice(5).replace("-", "/")}</span>
+              <span style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 500 }}>{e.category}</div>
+                {e.memo && (
+                  <div style={{ fontSize: 11, color: PALETTE.textFaint, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.memo}</div>
+                )}
+              </span>
+              <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: PALETTE.stamp }}>
+                {e.type === "expense" ? fmtYen(e.amount) : ""}
+              </span>
+              <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: PALETTE.income }}>
+                {e.type === "income" ? fmtYen(e.amount) : ""}
+              </span>
+              <span style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: PALETTE.ink }}>{fmtYen(e.balance)}</span>
+            </div>
+          ))}
+        </>
+      )}
+
+      {viewMode === "calendar" && (
+        <div style={{ paddingBottom: 4 }}>
+          <div style={{ padding: "10px 20px 4px", fontSize: 11, color: PALETTE.textFaint, borderTop: `1px solid ${PALETTE.rule}` }}>
+            {selectedDay ? `${selectedDay.slice(5).replace("-", "/")} の記録` : "この月の記録(日付をタップで絞り込み)"}
+          </div>
+          {groupedDatesDesc.length === 0 && (
+            <div style={{ padding: "40px 20px", textAlign: "center", color: PALETTE.textFaint, fontSize: 13 }}>記録がありません。</div>
+          )}
+          {groupedDatesDesc.map((dateStr) => (
+            <div key={dateStr}>
+              <div style={{ padding: "8px 20px 4px", fontSize: 12, fontWeight: 700, color: PALETTE.ink, background: PALETTE.paperDark }}>
+                {fmtDateHeader(dateStr)}
+              </div>
+              {groupedByDate[dateStr].map((e) => (
+                <div
+                  key={e.id}
+                  className="kzk-row"
+                  onClick={() => openEditForm(e)}
+                  style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "12px 20px", cursor: "pointer", gap: 10 }}
+                >
+                  <span style={{ fontSize: 14, minWidth: 0 }}>
+                    <span style={{ fontWeight: 700 }}>{e.category}</span>
+                    {e.memo && <span style={{ color: PALETTE.textFaint, fontSize: 12 }}> ({e.memo})</span>}
+                  </span>
+                  <span
+                    style={{
+                      flexShrink: 0,
+                      fontFamily: "'JetBrains Mono', monospace",
+                      fontSize: 15,
+                      fontWeight: 700,
+                      color: e.type === "expense" ? PALETTE.stamp : PALETTE.income,
+                    }}
+                  >
+                    {e.type === "expense" ? "" : "+"}
+                    {fmtYen(e.amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ position: "fixed", bottom: 20, right: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+        <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFile} />
+        <button className="kzk-btn" onClick={() => fileInputRef.current && fileInputRef.current.click()} style={fabStyle(PALETTE.ink)} aria-label="スクショを添付">
+          <ImageIcon size={20} color={PALETTE.paper} />
+        </button>
+        <button className="kzk-btn" onClick={openNewForm} style={fabStyle(PALETTE.stamp)} aria-label="手で記帳する">
+          <PenLine size={20} color={PALETTE.paper} />
+        </button>
+      </div>
+
+      {showForm && (
+        <div
+          style={{ position: "fixed", inset: 0, background: "rgba(38,52,74,0.42)", display: "flex", alignItems: "flex-end", zIndex: 50 }}
+          onClick={closeForm}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: PALETTE.paper,
+              width: "100%",
+              maxHeight: "88vh",
+              overflowY: "auto",
+              borderRadius: "18px 18px 0 0",
+              padding: "18px 20px 28px",
+              boxShadow: "0 -8px 30px rgba(0,0,0,0.2)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <span style={{ fontFamily: "'Shippori Mincho', serif", fontSize: 17, fontWeight: 700, color: PALETTE.ink }}>
+                {editingId ? "記帳を編集" : "記帳する"}
+              </span>
+              <button className="kzk-btn" onClick={closeForm} style={{ background: "none", border: "none", padding: 6 }}>
+                <X size={20} color={PALETTE.textFaint} />
+              </button>
+            </div>
+
+            {form.photo && (
+              <div style={{ marginBottom: 12, borderRadius: 10, overflow: "hidden", border: `1px solid ${PALETTE.rule}` }}>
+                <img src={form.photo} alt="スクショ" style={{ width: "100%", maxHeight: 160, objectFit: "cover", display: "block" }} />
+              </div>
+            )}
+
+            {ocrLoading && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: PALETTE.textFaint, marginBottom: 10 }}>
+                <Loader2 className="kzk-spin" size={14} /> {ocrNote || "読み取り中…"}
+              </div>
+            )}
+            {ocrNote && !ocrLoading && (
+              <div style={{ fontSize: 12, color: ocrNote.startsWith("OCR失敗") || ocrNote.includes("読み取れません") ? PALETTE.stamp : PALETTE.income, marginBottom: 10 }}>{ocrNote}</div>
+            )}
+
+            <div style={{ marginBottom: 14 }}>
+              <button
+                className="kzk-btn"
+                onClick={handleClipboardFill}
+                style={{
+                  width: "100%",
+                  padding: "11px 0",
+                  borderRadius: 8,
+                  border: `1px dashed ${PALETTE.ink}`,
+                  background: "transparent",
+                  color: PALETTE.ink,
+                  fontSize: 13,
+                  fontWeight: 700,
+                }}
+              >
+                📋 クリップボードから自動入力
+              </button>
+              {pasteNote && <div style={{ fontSize: 11, color: showPaste ? PALETTE.stamp : PALETTE.income, marginTop: 6 }}>{pasteNote}</div>}
+              {showPaste && (
+                <div style={{ marginTop: 8 }}>
+                  <textarea
+                    value={pasteText}
+                    onChange={(e) => setPasteText(e.target.value)}
+                    placeholder={"ここに長押し→ペーストで貼り付け"}
+                    rows={4}
+                    style={{ ...inputStyle, marginBottom: 8, fontSize: 12, resize: "vertical" }}
+                  />
+                  <button
+                    className="kzk-btn"
+                    onClick={() => processText(pasteText)}
+                    style={{ width: "100%", padding: "9px 0", borderRadius: 8, border: "none", background: PALETTE.ink, color: PALETTE.paper, fontSize: 13, fontWeight: 700 }}
+                  >
+                    この内容を反映する
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+              {[{ key: "expense", label: "支出" }, { key: "income", label: "収入" }].map((t) => (
+                <button
+                  key={t.key}
+                  className="kzk-btn"
+                  onClick={() => setForm((f) => ({ ...f, type: t.key, category: t.key === "expense" ? EXPENSE_CATS[0] : INCOME_CATS[0] }))}
+                  style={{
+                    flex: 1,
+                    padding: "10px 0",
+                    borderRadius: 999,
+                    border: `1.5px solid ${form.type === t.key ? (t.key === "expense" ? PALETTE.stamp : PALETTE.income) : PALETTE.rule}`,
+                    background: form.type === t.key ? (t.key === "expense" ? "#B23A2E14" : "#3D6B4F14") : "transparent",
+                    color: form.type === t.key ? (t.key === "expense" ? PALETTE.stamp : PALETTE.income) : PALETTE.textFaint,
+                    fontWeight: 700,
+                    fontSize: 13,
+                    fontFamily: "'Noto Sans JP', sans-serif",
+                  }}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            <label style={labelStyle}>金額</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, color: PALETTE.ink }}>¥</span>
+              <input
+                type="tel"
+                inputMode="numeric"
+                value={form.amount}
+                onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value.replace(/[^0-9]/g, "") }))}
+                placeholder="0"
+                style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 26, fontWeight: 600, border: "none", borderBottom: `2px solid ${PALETTE.ink}`, background: "transparent", padding: "4px 2px", outline: "none", color: PALETTE.ink }}
+              />
+            </div>
+            {amountCandidates.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 10, color: PALETTE.textFaint, marginBottom: 4 }}>金額候補(タップで入力)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {amountCandidates.map((n, i) => (
+                    <button
+                      key={i}
+                      className="kzk-btn"
+                      onClick={() => setForm((f) => ({ ...f, amount: String(n) }))}
+                      style={{ padding: "6px 12px", borderRadius: 999, fontSize: 13, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, border: `1px solid ${String(form.amount) === String(n) ? PALETTE.ink : PALETTE.income}`, background: String(form.amount) === String(n) ? PALETTE.ink : "transparent", color: String(form.amount) === String(n) ? PALETTE.paper : PALETTE.income }}
+                    >
+                      ¥{n.toLocaleString("ja-JP")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {amountCandidates.length === 0 && <div style={{ marginBottom: 6 }} />}
+
+            <label style={labelStyle}>日付</label>
+            <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={inputStyle} />
+
+            <label style={labelStyle}>こうもく</label>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 14 }}>
+              {cats.map((c) => (
+                <button
+                  key={c}
+                  className="kzk-btn"
+                  onClick={() => setForm((f) => ({ ...f, category: c }))}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 999,
+                    fontSize: 12,
+                    border: `1px solid ${form.category === c ? PALETTE.ink : PALETTE.rule}`,
+                    background: form.category === c ? PALETTE.ink : "transparent",
+                    color: form.category === c ? PALETTE.paper : PALETTE.text,
+                  }}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
+
+            <label style={labelStyle}>メモ</label>
+            <input
+              type="text"
+              value={form.memo}
+              onChange={(e) => setForm((f) => ({ ...f, memo: e.target.value }))}
+              placeholder="任意"
+              style={{ ...inputStyle, marginBottom: 8 }}
+            />
+
+            {ocrCandidates.length > 0 && (
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 10, color: PALETTE.textFaint, marginBottom: 4 }}>読み取り候補(タップで入力)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {ocrCandidates.map((c, i) => (
+                    <button
+                      key={i}
+                      className="kzk-btn"
+                      onClick={() => setForm((f) => ({ ...f, memo: c }))}
+                      style={{ padding: "5px 10px", borderRadius: 999, fontSize: 12, border: `1px solid ${PALETTE.income}`, background: "transparent", color: PALETTE.income, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                    >
+                      {c}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                <span style={{ fontSize: 10, color: PALETTE.textFaint }}>定番(タップで入力)</span>
+                <button
+                  className="kzk-btn"
+                  onClick={() => setShowPresetEdit((v) => !v)}
+                  style={{ fontSize: 10, color: PALETTE.textFaint, background: "none", border: "none", textDecoration: "underline" }}
+                >
+                  {showPresetEdit ? "完了" : "編集"}
+                </button>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {memoPresets.map((p) => (
+                  <span key={p} style={{ display: "inline-flex", alignItems: "center" }}>
+                    <button
+                      className="kzk-btn"
+                      onClick={() => !showPresetEdit && setForm((f) => ({ ...f, memo: p }))}
+                      style={{ padding: "5px 10px", borderRadius: showPresetEdit ? "999px 0 0 999px" : 999, fontSize: 12, border: `1px solid ${PALETTE.rule}`, background: PALETTE.paperDark, color: PALETTE.text }}
+                    >
+                      {p}
+                    </button>
+                    {showPresetEdit && (
+                      <button
+                        className="kzk-btn"
+                        onClick={() => removePreset(p)}
+                        style={{ padding: "5px 8px", borderRadius: "0 999px 999px 0", fontSize: 12, border: `1px solid ${PALETTE.stamp}`, borderLeft: "none", background: "transparent", color: PALETTE.stamp }}
+                        aria-label="削除"
+                      >
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {showPresetEdit && (
+                <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                  <input
+                    type="text"
+                    value={newPreset}
+                    onChange={(e) => setNewPreset(e.target.value)}
+                    placeholder="定番を追加(店名など)"
+                    style={{ ...inputStyle, marginBottom: 0, fontSize: 12, padding: "8px 10px" }}
+                  />
+                  <button
+                    className="kzk-btn"
+                    onClick={addPreset}
+                    style={{ flexShrink: 0, padding: "8px 14px", borderRadius: 8, border: "none", background: PALETTE.ink, color: PALETTE.paper, fontSize: 12, fontWeight: 700 }}
+                  >
+                    追加
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", gap: 10 }}>
+              {editingId && (
+                <button className="kzk-btn" onClick={handleDelete} style={{ padding: "13px 16px", borderRadius: 10, border: `1px solid ${PALETTE.rule}`, background: "transparent", color: PALETTE.stamp }} aria-label="削除">
+                  <Trash2 size={18} />
+                </button>
+              )}
+              <button
+                className="kzk-btn"
+                onClick={handleSubmit}
+                disabled={!form.amount}
+                style={{
+                  flex: 1,
+                  padding: "13px 0",
+                  borderRadius: 10,
+                  border: "none",
+                  background: PALETTE.stamp,
+                  color: PALETTE.paper,
+                  fontWeight: 700,
+                  fontSize: 15,
+                  fontFamily: "'Shippori Mincho', serif",
+                  letterSpacing: "0.1em",
+                  opacity: form.amount ? 1 : 0.4,
+                }}
+              >
+                {editingId ? "更新する" : "記帳する"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {stamping && (
+        <div style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none", zIndex: 60 }}>
+          <div
+            style={{
+              width: 108,
+              height: 108,
+              borderRadius: "50%",
+              border: `4px solid ${PALETTE.stamp}`,
+              color: PALETTE.stamp,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "#F2ECDFcc",
+              animation: "stampIn 0.6s ease-out",
+            }}
+          >
+            <Check size={40} strokeWidth={3} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const navBtnStyle = { background: "none", border: "none", padding: 6, display: "flex" };
+const labelStyle = { display: "block", fontSize: 11, color: PALETTE.textFaint, marginBottom: 6, letterSpacing: "0.05em" };
+const inputStyle = { width: "100%", padding: "10px 12px", borderRadius: 8, border: `1px solid ${PALETTE.rule}`, background: "#fff", fontSize: 14, marginBottom: 14, fontFamily: "'Noto Sans JP', sans-serif", color: PALETTE.text, boxSizing: "border-box" };
+
+function fabStyle(bg) {
+  return { width: 52, height: 52, borderRadius: "50%", border: "none", background: bg, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 4px 14px rgba(38,52,74,0.35)" };
+}
+
+function KozukaichoApp() {
+  return (
+    <ErrorBoundary>
+      <KozukaichoInner />
+    </ErrorBoundary>
+  );
+}
+
+try {
+  const root = ReactDOM.createRoot(document.getElementById("root"));
+  root.render(<KozukaichoApp />);
+} catch (e) {
+  document.getElementById("root").innerHTML =
+    '<div style="padding:24px;font-family:sans-serif;color:#B23A2E;font-size:12px;white-space:pre-wrap">起動エラー: ' +
+    String((e && (e.stack || e.message)) || e) + "</div>";
+}
+</script>
+</body>
+</html>
