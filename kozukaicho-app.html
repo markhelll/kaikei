@@ -209,13 +209,14 @@ async function runOcr(dataUrl, onStage) {
     }
 
     const amount = extractAmountFromText(jpText);
+    const amountCandidates = collectAmountCandidates(jpText);
     // 店名は英語結果を優先しつつ、良い候補が無ければ日本語結果で補完
     const storeEn = extractStoreFromText(enText, true);
     const storeJp = extractStoreFromText(jpText, false);
     const store = storeEn || storeJp;
 
     const storeCandidates = collectStoreCandidates(jpText, enText);
-    return { amount, store, storeCandidates, rawText: jpText };
+    return { amount, amountCandidates, store, storeCandidates, rawText: jpText };
   } finally {
     if (worker) {
       try { await worker.terminate(); } catch (e) {}
@@ -223,34 +224,64 @@ async function runOcr(dataUrl, onStage) {
   }
 }
 
+function normalizeDigits(s) {
+  // OCRがよく間違える文字を数字に補正
+  return s
+    .replace(/[Oo〇]/g, "0")
+    .replace(/[lI|]/g, "1")
+    .replace(/[SｓＳ]/g, "5")
+    .replace(/[，、]/g, ",")
+    .replace(/．/g, ".")
+    .replace(/[０-９]/g, (d) => String("０１２３４５６７８９".indexOf(d)));
+}
+
 function extractAmountFromText(text) {
-  const lines = text.split("\n");
+  const norm = normalizeDigits(text);
+  const lines = norm.split("\n");
   const priorityWords = ["合計", "ご注文金額", "お支払", "支払金額", "総額", "利用金額", "ご利用金額", "金額"];
   const numRe = /([0-9][0-9,]{2,})\s*円/g;
 
-  // 1) 優先ワードを含む行の「○○円」
   for (const line of lines) {
     if (priorityWords.some((w) => line.includes(w))) {
       const m = [...line.matchAll(numRe)];
       if (m.length) return parseInt(m[m.length - 1][1].replace(/,/g, ""), 10);
     }
   }
-  // 2) 全体の「○○円」で最大
-  const all = [...text.matchAll(numRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
-  if (all.length) return Math.max(...all.filter((n) => n >= 10 && n <= 10000000));
+  const all = [...norm.matchAll(numRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  const allF = all.filter((n) => n >= 10 && n <= 10000000);
+  if (allF.length) return Math.max(...allF);
 
-  // 3) ¥表記
   const yenRe = /[¥￥]\s*([0-9][0-9,]{2,})/g;
-  const allYen = [...text.matchAll(yenRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  const allYen = [...norm.matchAll(yenRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
   if (allYen.length) return Math.max(...allYen);
 
-  // 4) カンマ区切りの大きな数字(10,000 のような、決済画面の金額表示)。時刻/日付/年を除外
-  const commaNumRe = /\b([1-9]\d{0,2}(?:,\d{3})+)\b/g;
-  const commaNums = [...text.matchAll(commaNumRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
-  if (commaNums.length) return Math.max(...commaNums.filter((n) => n <= 10000000));
+  // カンマ区切りの大きな数字(10,000 のような決済画面の金額)。時刻/日付を避けるため3桁区切り必須
+  const commaNumRe = /([1-9][0-9]{0,2}(?:,[0-9]{3})+)/g;
+  const commaNums = [...norm.matchAll(commaNumRe)].map((m) => parseInt(m[1].replace(/,/g, ""), 10));
+  const commaF = commaNums.filter((n) => n <= 10000000);
+  if (commaF.length) return Math.max(...commaF);
 
   return null;
 }
+
+// 金額候補を複数集める(自動で拾えなかった時にタップ選択できるように)
+function collectAmountCandidates(text) {
+  const norm = normalizeDigits(text);
+  const found = new Set();
+  const push = (n) => { if (n >= 10 && n <= 10000000) found.add(n); };
+  for (const m of norm.matchAll(/([0-9][0-9,]{2,})\s*円/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  for (const m of norm.matchAll(/[¥￥]\s*([0-9][0-9,]{2,})/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  for (const m of norm.matchAll(/([1-9][0-9]{0,2}(?:,[0-9]{3})+)/g)) push(parseInt(m[1].replace(/,/g, ""), 10));
+  // 単独の3桁以上の数字も候補に(時刻の可能性がある4桁未満は控えめに)
+  for (const m of norm.matchAll(/\b([0-9]{3,7})\b/g)) {
+    const n = parseInt(m[1], 10);
+    if (n >= 100) push(n);
+  }
+  return [...found].sort((a, b) => b - a).slice(0, 6);
+}
+
+function normalizeDigitsMarker() {}
+
 
 function extractStoreFromText(text, englishMode) {
   if (!text) return null;
@@ -430,6 +461,7 @@ function KozukaichoInner() {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [ocrNote, setOcrNote] = useState(null);
   const [ocrCandidates, setOcrCandidates] = useState([]);
+  const [amountCandidates, setAmountCandidates] = useState([]);
   const [memoPresets, setMemoPresets] = useState(DEFAULT_MEMO_PRESETS);
   const [showPresetEdit, setShowPresetEdit] = useState(false);
   const [newPreset, setNewPreset] = useState("");
@@ -626,16 +658,20 @@ function KozukaichoInner() {
   async function tryOcr(dataUrl) {
     setOcrNote("読み取り準備中(ライブラリ読み込み)…");
     setOcrCandidates([]);
+    setAmountCandidates([]);
     setOcrLoading(true);
     try {
-      const { amount, storeCandidates } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
+      const { amount, amountCandidates: amtCands, storeCandidates } = await runOcr(dataUrl, (stage) => setOcrNote(stage));
       setOcrCandidates(storeCandidates || []);
+      setAmountCandidates(amtCands || []);
       setForm((f) => ({
         ...f,
         amount: amount != null ? String(amount) : f.amount,
       }));
       if (amount != null) {
-        setOcrNote(`金額 ¥${amount.toLocaleString("ja-JP")} を読み取りました。メモは下の候補か定番から選べます。`);
+        setOcrNote(`金額 ¥${amount.toLocaleString("ja-JP")} を読み取りました。違う場合は下の金額候補から選べます。メモは候補か定番から選べます。`);
+      } else if ((amtCands || []).length > 0) {
+        setOcrNote("金額を自動確定できませんでした。下の「金額候補」からタップで選んでください。");
       } else {
         setOcrNote("金額を読み取れませんでした。手入力してください。");
       }
@@ -757,6 +793,7 @@ function KozukaichoInner() {
             お小遣い帳
           </span>
           <span style={{ fontSize: 11, color: PALETTE.textFaint, letterSpacing: "0.1em" }}>KOZUKAI-CHO</span>
+          <span style={{ fontSize: 10, color: PALETTE.stamp, fontWeight: 700, marginLeft: 4 }}>v7</span>
         </div>
 
         <div style={{ marginTop: 18, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
@@ -1080,7 +1117,7 @@ function KozukaichoInner() {
             </div>
 
             <label style={labelStyle}>金額</label>
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
               <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 22, color: PALETTE.ink }}>¥</span>
               <input
                 type="tel"
@@ -1091,6 +1128,24 @@ function KozukaichoInner() {
                 style={{ flex: 1, fontFamily: "'JetBrains Mono', monospace", fontSize: 26, fontWeight: 600, border: "none", borderBottom: `2px solid ${PALETTE.ink}`, background: "transparent", padding: "4px 2px", outline: "none", color: PALETTE.ink }}
               />
             </div>
+            {amountCandidates.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 10, color: PALETTE.textFaint, marginBottom: 4 }}>金額候補(タップで入力)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {amountCandidates.map((n, i) => (
+                    <button
+                      key={i}
+                      className="kzk-btn"
+                      onClick={() => setForm((f) => ({ ...f, amount: String(n) }))}
+                      style={{ padding: "6px 12px", borderRadius: 999, fontSize: 13, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, border: `1px solid ${String(form.amount) === String(n) ? PALETTE.ink : PALETTE.income}`, background: String(form.amount) === String(n) ? PALETTE.ink : "transparent", color: String(form.amount) === String(n) ? PALETTE.paper : PALETTE.income }}
+                    >
+                      ¥{n.toLocaleString("ja-JP")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {amountCandidates.length === 0 && <div style={{ marginBottom: 6 }} />}
 
             <label style={labelStyle}>日付</label>
             <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} style={inputStyle} />
